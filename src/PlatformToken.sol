@@ -36,6 +36,7 @@ contract PlatformToken is ERC20, Owned {
     /// @notice Error thrown when balance is insufficient for burn
     error InsufficientBalance();
     /// @notice Address of the DepositManager contract that can mint and burn tokens
+
     address public depositManager;
 
     /// @notice Emitted when the DepositManager address is set
