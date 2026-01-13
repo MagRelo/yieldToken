@@ -21,6 +21,20 @@ import "solmate/auth/Owned.sol";
  * @custom:security This contract uses Solmate's Owned for access control
  */
 contract PlatformToken is ERC20, Owned {
+    /// @notice Error thrown when DepositManager is not set
+    error DepositManagerNotSet();
+    /// @notice Error thrown when caller is not the DepositManager
+    error OnlyDepositManager();
+    /// @notice Error thrown when depositManager address is invalid
+    error InvalidDepositManagerAddress();
+    /// @notice Error thrown when trying to mint to zero address
+    error CannotMintToZeroAddress();
+    /// @notice Error thrown when amount is zero or invalid
+    error InvalidAmount();
+    /// @notice Error thrown when trying to burn from zero address
+    error CannotBurnFromZeroAddress();
+    /// @notice Error thrown when balance is insufficient for burn
+    error InsufficientBalance();
     /// @notice Address of the DepositManager contract that can mint and burn tokens
     address public depositManager;
 
@@ -51,8 +65,8 @@ contract PlatformToken is ERC20, Owned {
      * @notice Reverts if DepositManager is not set or caller is not the DepositManager
      */
     modifier onlyDepositManager() {
-        require(depositManager != address(0), "DepositManager not set");
-        require(msg.sender == depositManager, "Only depositManager can call this function");
+        if (depositManager == address(0)) revert DepositManagerNotSet();
+        if (msg.sender != depositManager) revert OnlyDepositManager();
         _;
     }
 
@@ -68,7 +82,7 @@ contract PlatformToken is ERC20, Owned {
      * Emits a {DepositManagerSet} event
      */
     function setDepositManager(address _depositManager) external onlyOwner {
-        require(_depositManager != address(0), "Invalid depositManager address");
+        if (_depositManager == address(0)) revert InvalidDepositManagerAddress();
         depositManager = _depositManager;
         emit DepositManagerSet(_depositManager);
     }
@@ -87,8 +101,8 @@ contract PlatformToken is ERC20, Owned {
      * Emits a {DepositManagerMint} event
      */
     function mint(address to, uint256 amount) external onlyDepositManager {
-        require(to != address(0), "Cannot mint to zero address");
-        require(amount > 0, "Amount must be greater than 0");
+        if (to == address(0)) revert CannotMintToZeroAddress();
+        if (amount == 0) revert InvalidAmount();
 
         _mint(to, amount);
 
@@ -110,9 +124,9 @@ contract PlatformToken is ERC20, Owned {
      * Emits a {DepositManagerBurn} event
      */
     function burn(address from, uint256 amount) external onlyDepositManager {
-        require(from != address(0), "Cannot burn from zero address");
-        require(amount > 0, "Amount must be greater than 0");
-        require(balanceOf[from] >= amount, "Insufficient balance to burn");
+        if (from == address(0)) revert CannotBurnFromZeroAddress();
+        if (amount == 0) revert InvalidAmount();
+        if (balanceOf[from] < amount) revert InsufficientBalance();
 
         _burn(from, amount);
 

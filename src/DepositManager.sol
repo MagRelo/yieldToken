@@ -31,6 +31,28 @@ import {ISpoke} from "aave-v4/src/spoke/interfaces/ISpoke.sol";
  * @custom:security This contract uses Solmate's ReentrancyGuard and Owned for security
  */
 contract DepositManager is ReentrancyGuard, Owned {
+    /// @notice Error thrown when USDC token address is zero
+    error ZeroUSDCAddress();
+    /// @notice Error thrown when platform token address is zero
+    error ZeroPlatformTokenAddress();
+    /// @notice Error thrown when Aave Spoke address is zero
+    error ZeroAaveSpokeAddress();
+    /// @notice Error thrown when USDC is not found in Aave Spoke reserves
+    error USDCNotFoundInReserves();
+    /// @notice Error thrown when amount is zero or invalid
+    error InvalidAmount();
+    /// @notice Error thrown when user has insufficient platform tokens
+    error InsufficientPlatformTokens();
+    /// @notice Error thrown when no USDC can be returned
+    error NoUSDCToReturn();
+    /// @notice Error thrown when Aave withdraw is paused and contract balance is insufficient
+    error AaveWithdrawPausedInsufficientBalance();
+    /// @notice Error thrown when recipient address is zero
+    error InvalidRecipient();
+    /// @notice Error thrown when there is no excess USDC to withdraw
+    error NoExcessUSDC();
+    /// @notice Error thrown when there are no funds to withdraw
+    error NoFundsToWithdraw();
     /// @notice The USDC token contract
     ERC20 public immutable usdcToken;
 
@@ -88,9 +110,9 @@ contract DepositManager is ReentrancyGuard, Owned {
      * - USDC must be listed as a reserve on the Aave Spoke
      */
     constructor(address _usdcToken, address _platformToken, address _aaveSpoke) Owned(msg.sender) {
-        require(_usdcToken != address(0), "USDC token cannot be zero address");
-        require(_platformToken != address(0), "Platform token cannot be zero address");
-        require(_aaveSpoke != address(0), "Aave Spoke cannot be zero address");
+        if (_usdcToken == address(0)) revert ZeroUSDCAddress();
+        if (_platformToken == address(0)) revert ZeroPlatformTokenAddress();
+        if (_aaveSpoke == address(0)) revert ZeroAaveSpokeAddress();
 
         usdcToken = ERC20(_usdcToken);
         platformToken = PlatformToken(_platformToken);
@@ -108,7 +130,7 @@ contract DepositManager is ReentrancyGuard, Owned {
             }
         }
         
-        require(foundReserveId != type(uint256).max, "USDC not found in Aave Spoke reserves");
+        if (foundReserveId == type(uint256).max) revert USDCNotFoundInReserves();
         usdcReserveId = foundReserveId;
     }
 
@@ -126,7 +148,7 @@ contract DepositManager is ReentrancyGuard, Owned {
      * Emits a {AaveDepositFallback} event if Aave deposit fails
      */
     function depositUSDC(uint256 amount) external nonReentrant {
-        require(amount > 0, "Amount must be greater than 0");
+        if (amount == 0) revert InvalidAmount();
 
         // Calculate platform tokens to mint (1:1 ratio)
         // USDC has 6 decimals, PlatformToken has 18 decimals
@@ -179,13 +201,13 @@ contract DepositManager is ReentrancyGuard, Owned {
      * Emits a {USDCWithdrawn} event
      */
     function withdrawUSDC(uint256 platformTokenAmount) external nonReentrant {
-        require(platformTokenAmount > 0, "Amount must be greater than 0");
-        require(platformToken.balanceOf(msg.sender) >= platformTokenAmount, "Insufficient platform tokens");
+        if (platformTokenAmount == 0) revert InvalidAmount();
+        if (platformToken.balanceOf(msg.sender) < platformTokenAmount) revert InsufficientPlatformTokens();
 
         // Calculate USDC to return (1:1 ratio)
         // PlatformToken has 18 decimals, USDC has 6 decimals
         uint256 usdcToReturn = platformTokenAmount / 1e12; // Convert 18 decimals to 6 decimals
-        require(usdcToReturn > 0, "No USDC to return");
+        if (usdcToReturn == 0) revert NoUSDCToReturn();
 
         // Check if we have sufficient USDC in contract to avoid Aave withdrawal
         uint256 tokenManagerUSDCBalance = usdcToken.balanceOf(address(this));
@@ -197,7 +219,7 @@ contract DepositManager is ReentrancyGuard, Owned {
 
         // Only require Aave to be unpaused if we need to withdraw from it
         if (!hasSufficientContractBalance) {
-            require(!isPaused, "Aave withdraw is paused and insufficient contract balance");
+            if (isPaused) revert AaveWithdrawPausedInsufficientBalance();
         }
 
         // Burn platform tokens from user
@@ -350,7 +372,7 @@ contract DepositManager is ReentrancyGuard, Owned {
      * Emits a {BalanceSupply} event
      */
     function balanceSupply(address to) external onlyOwner {
-        require(to != address(0), "Invalid recipient");
+        if (to == address(0)) revert InvalidRecipient();
 
         // Calculate required USDC to match token supply
         uint256 totalTokensMinted = platformToken.totalSupply();
@@ -367,7 +389,7 @@ contract DepositManager is ReentrancyGuard, Owned {
             excessUSDC = totalAvailableUSDC - requiredUSDC;
         }
 
-        require(excessUSDC > 0, "No excess USDC to withdraw");
+        if (excessUSDC == 0) revert NoExcessUSDC();
 
         // Withdraw from Aave if needed
         if (tokenManagerBalance < excessUSDC) {
@@ -396,10 +418,10 @@ contract DepositManager is ReentrancyGuard, Owned {
      * Emits an {EmergencyWithdrawal} event
      */
     function emergencyWithdrawAll(address to) external onlyOwner {
-        require(to != address(0), "Invalid recipient");
+        if (to == address(0)) revert InvalidRecipient();
 
         uint256 totalBalance = this.getTotalAvailableBalance();
-        require(totalBalance > 0, "No funds to withdraw");
+        if (totalBalance == 0) revert NoFundsToWithdraw();
 
         // Withdraw from Aave if needed
         uint256 tokenManagerBalance = usdcToken.balanceOf(address(this));
