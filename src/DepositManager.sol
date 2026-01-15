@@ -6,31 +6,35 @@ import "solmate/utils/SafeTransferLib.sol";
 import "solmate/utils/ReentrancyGuard.sol";
 import "solmate/auth/Owned.sol";
 import "./PlatformToken.sol";
-import {ISpoke} from "aave-v4/src/spoke/interfaces/ISpoke.sol";
+import {IPool} from "aave-v3/interfaces/IPool.sol";
+import {DataTypes} from "aave-v3/protocol/libraries/types/DataTypes.sol";
+import {ReserveConfiguration} from "aave-v3/protocol/libraries/configuration/ReserveConfiguration.sol";
 
 /**
  * @title DepositManager
  * @author MagRelo
- * @dev Manages USDC deposits, CUT token minting/burning, and yield generation through Aave v4
+ * @dev Manages USDC deposits, CUT token minting/burning, and yield generation through Aave v3
  *
  * This contract implements a simplified token system where:
  * - Users deposit USDC and receive CUT tokens in a 1:1 ratio
- * - USDC is automatically supplied to Aave v4 for yield generation
- * - If Aave v4 is paused or deposit fails, USDC is stored directly in the contract
+ * - USDC is automatically supplied to Aave v3 for yield generation
+ * - If Aave v3 is paused or deposit fails, USDC is stored directly in the contract
  * - Users can withdraw their original deposit amount (1:1 ratio)
  * - All yield generated stays in the contract for platform use
  *
  * Key Features:
  * - 1:1 USDC to CUT token conversion
- * - Automatic Aave v4 integration for yield generation
+ * - Automatic Aave v3 integration for yield generation
  * - Fallback to direct USDC storage if Aave is unavailable
  * - Yield retention by platform (no user distribution)
  * - Emergency withdrawal capabilities
- * - Aave v4 pause state handling with graceful fallback
+ * - Aave v3 pause state handling with graceful fallback
  *
  * @custom:security This contract uses Solmate's ReentrancyGuard and Owned for security
  */
 contract DepositManager is ReentrancyGuard, Owned {
+    using ReserveConfiguration for DataTypes.ReserveConfigurationMap;
+
     /// @notice Minimum deposit amount: $0.01 USDC (0.01e6 = 10000)
     uint256 public constant MIN_DEPOSIT_AMOUNT = 10000; // $0.01 USDC
 
@@ -48,10 +52,8 @@ contract DepositManager is ReentrancyGuard, Owned {
     error ZeroUSDCAddress();
     /// @notice Error thrown when platform token address is zero
     error ZeroPlatformTokenAddress();
-    /// @notice Error thrown when Aave Spoke address is zero
-    error ZeroAaveSpokeAddress();
-    /// @notice Error thrown when USDC is not found in Aave Spoke reserves
-    error USDCNotFoundInReserves();
+    /// @notice Error thrown when Aave Pool address is zero
+    error ZeroAavePoolAddress();
     /// @notice Error thrown when amount is zero or invalid
     error InvalidAmount();
     /// @notice Error thrown when amount is below minimum
@@ -72,18 +74,18 @@ contract DepositManager is ReentrancyGuard, Owned {
     error NoFundsToWithdraw();
     /// @notice Error thrown when contract is paused
     error ContractPaused();
-    /// @notice The USDC token contract
 
+    /// @notice The USDC token contract
     ERC20 public immutable usdcToken;
 
     /// @notice The CUT platform token contract
     PlatformToken public immutable platformToken;
 
-    /// @notice The Aave v4 Spoke contract for yield generation
-    ISpoke public immutable aaveSpoke;
+    /// @notice The Aave v3 Pool contract for yield generation
+    IPool public immutable aavePool;
 
-    /// @notice The reserve ID for USDC on the Aave Spoke
-    uint256 public immutable usdcReserveId;
+    /// @notice The aToken address for USDC (for balance queries)
+    address public immutable aUsdcToken;
 
     /// @notice Emitted when a user deposits USDC and receives CUT tokens
     /// @param user The address of the user making the deposit
@@ -130,9 +132,8 @@ contract DepositManager is ReentrancyGuard, Owned {
 
     /// @notice Emitted when Aave supply succeeds
     /// @param user The address of the user making the deposit
-    /// @param shares The amount of shares received from Aave
     /// @param amount The amount of USDC supplied to Aave
-    event AaveSupplySuccess(address indexed user, uint256 shares, uint256 amount);
+    event AaveSupplySuccess(address indexed user, uint256 amount);
 
     /// @notice Emitted when Aave deposit fails and USDC is stored directly in contract
     /// @param user The address of the user making the deposit
@@ -143,38 +144,25 @@ contract DepositManager is ReentrancyGuard, Owned {
     /**
      * @notice Constructor initializes the DepositManager with required contract addresses
      * @dev Sets the deployer as the owner and validates all contract addresses
-     * @dev Finds the reserveId for USDC by iterating through reserves
      * @param _usdcToken The address of the USDC token contract
      * @param _platformToken The address of the CUT platform token contract
-     * @param _aaveSpoke The address of the Aave v4 Spoke contract
+     * @param _aavePool The address of the Aave v3 Pool contract
      *
      * Requirements:
      * - All contract addresses must not be zero addresses
-     * - USDC must be listed as a reserve on the Aave Spoke
      */
-    constructor(address _usdcToken, address _platformToken, address _aaveSpoke) Owned(msg.sender) {
+    constructor(address _usdcToken, address _platformToken, address _aavePool) Owned(msg.sender) {
         if (_usdcToken == address(0)) revert ZeroUSDCAddress();
         if (_platformToken == address(0)) revert ZeroPlatformTokenAddress();
-        if (_aaveSpoke == address(0)) revert ZeroAaveSpokeAddress();
+        if (_aavePool == address(0)) revert ZeroAavePoolAddress();
 
         usdcToken = ERC20(_usdcToken);
         platformToken = PlatformToken(_platformToken);
-        aaveSpoke = ISpoke(_aaveSpoke);
+        aavePool = IPool(_aavePool);
 
-        // Find the reserveId for USDC
-        uint256 reserveCount = aaveSpoke.getReserveCount();
-        uint256 foundReserveId = type(uint256).max;
-
-        for (uint256 i = 0; i < reserveCount; i++) {
-            ISpoke.Reserve memory reserve = aaveSpoke.getReserve(i);
-            if (reserve.underlying == _usdcToken) {
-                foundReserveId = i;
-                break;
-            }
-        }
-
-        if (foundReserveId == type(uint256).max) revert USDCNotFoundInReserves();
-        usdcReserveId = foundReserveId;
+        // Get the aToken address for USDC from the pool
+        DataTypes.ReserveData memory reserveData = aavePool.getReserveData(_usdcToken);
+        aUsdcToken = reserveData.aTokenAddress;
     }
 
     /**
@@ -197,10 +185,8 @@ contract DepositManager is ReentrancyGuard, Owned {
 
     /**
      * @notice Deposits USDC and mints CUT tokens in a 1:1 ratio
-     * @dev Automatically supplies USDC to Aave v4 for yield generation
+     * @dev Automatically supplies USDC to Aave v3 for yield generation
      * Falls back to storing USDC directly in contract if Aave deposit fails
-     * @dev Note: No position manager registration needed - when onBehalfOf == address(this),
-     * Aave's _isPositionManager() returns true automatically (contract is its own position manager)
      * @param amount The amount of USDC to deposit
      *
      * Requirements:
@@ -236,7 +222,7 @@ contract DepositManager is ReentrancyGuard, Owned {
 
     /**
      * @notice Withdraws USDC by burning the specified amount of CUT tokens
-     * @dev Withdraws from Aave v4 if necessary to fulfill the withdrawal
+     * @dev Withdraws from Aave v3 if necessary to fulfill the withdrawal
      * Falls back to contract USDC if Aave is paused and sufficient funds are available
      * @param platformTokenAmount The amount of CUT tokens to burn
      *
@@ -244,7 +230,7 @@ contract DepositManager is ReentrancyGuard, Owned {
      * - Contract must not be paused
      * - platformTokenAmount must be >= MIN_WITHDRAW_AMOUNT (equivalent to $0.01 USDC)
      * - User must have sufficient CUT token balance
-     * - Either Aave v4 withdraw is not paused OR sufficient USDC is available in contract
+     * - Either Aave v3 withdraw is not paused OR sufficient USDC is available in contract
      *
      * Emits a {USDCWithdrawn} event
      */
@@ -266,8 +252,8 @@ contract DepositManager is ReentrancyGuard, Owned {
         // Check if Aave reserve is paused (frozen doesn't block withdrawals)
         // Only require Aave to be unpaused if we need to withdraw from it
         if (!hasSufficientContractBalance) {
-            ISpoke.ReserveConfig memory reserveConfig = aaveSpoke.getReserveConfig(usdcReserveId);
-            if (reserveConfig.paused) revert AaveWithdrawPausedInsufficientBalance();
+            DataTypes.ReserveConfigurationMap memory config = aavePool.getConfiguration(address(usdcToken));
+            if (config.getPaused()) revert AaveWithdrawPausedInsufficientBalance();
         }
 
         // Burn platform tokens from user
@@ -297,19 +283,16 @@ contract DepositManager is ReentrancyGuard, Owned {
     }
 
     /**
-     * @notice Internal function to supply USDC to Aave v4 for yield generation
+     * @notice Internal function to supply USDC to Aave v3 for yield generation
      * @dev Handles all Aave supply logic including approvals, pause checks, and error handling
-     * @dev Note: No position manager registration needed - when onBehalfOf == address(this),
-     * Aave's _isPositionManager() returns true automatically (contract is its own position manager)
      * @param amount The amount of USDC to supply to Aave
      * @param user The address making the deposit (for event logging)
      */
     function _supplyToAave(uint256 amount, address user) internal {
         // Check if Aave reserve is paused or frozen
-        // Cache reserve config to avoid multiple storage reads
-        ISpoke.ReserveConfig memory reserveConfig = aaveSpoke.getReserveConfig(usdcReserveId);
-        bool isPaused = reserveConfig.paused;
-        bool isFrozen = reserveConfig.frozen;
+        DataTypes.ReserveConfigurationMap memory config = aavePool.getConfiguration(address(usdcToken));
+        bool isPaused = config.getPaused();
+        bool isFrozen = config.getFrozen();
 
         // If paused/frozen, skip Aave and keep USDC in contract
         if (isPaused || isFrozen) {
@@ -319,19 +302,12 @@ contract DepositManager is ReentrancyGuard, Owned {
         }
 
         // Approve USDC for Aave - first reset to 0, then approve new amount
-        SafeTransferLib.safeApprove(usdcToken, address(aaveSpoke), 0);
-        SafeTransferLib.safeApprove(usdcToken, address(aaveSpoke), amount);
+        SafeTransferLib.safeApprove(usdcToken, address(aavePool), 0);
+        SafeTransferLib.safeApprove(usdcToken, address(aavePool), amount);
 
-        // Try to supply to Aave
-        try aaveSpoke.supply(usdcReserveId, amount, address(this)) returns (uint256 shares, uint256 supplied) {
-            // Aave deposit successful - check return values
-            if (supplied < amount) {
-                // Partial supply occurred - emit fallback event
-                emit AaveDepositFallback(user, amount, "Partial Aave supply");
-            } else {
-                // Full supply successful
-                emit AaveSupplySuccess(user, shares, supplied);
-            }
+        // Try to supply to Aave (V3 supply doesn't return values)
+        try aavePool.supply(address(usdcToken), amount, address(this), 0) {
+            emit AaveSupplySuccess(user, amount);
         } catch {
             // Aave deposit failed - USDC stays in contract
             emit AaveDepositFallback(user, amount, "Aave supply failed");
@@ -339,22 +315,22 @@ contract DepositManager is ReentrancyGuard, Owned {
     }
 
     /**
-     * @notice Internal function to withdraw USDC from Aave v4
+     * @notice Internal function to withdraw USDC from Aave v3
      * @dev Handles all Aave withdraw logic including pause checks and error handling
      * @param amount The amount of USDC to withdraw from Aave
      * @return amountWithdrawn The amount actually withdrawn from Aave (0 if paused or failed)
      */
     function _withdrawFromAave(uint256 amount) internal returns (uint256 amountWithdrawn) {
         // Check if Aave reserve is paused (frozen doesn't block withdrawals)
-        ISpoke.ReserveConfig memory reserveConfig = aaveSpoke.getReserveConfig(usdcReserveId);
-        bool isPaused = reserveConfig.paused;
+        DataTypes.ReserveConfigurationMap memory config = aavePool.getConfiguration(address(usdcToken));
+        bool isPaused = config.getPaused();
 
         if (isPaused) {
             return 0; // Can't withdraw if paused
         }
 
-        // Try to withdraw from Aave
-        try aaveSpoke.withdraw(usdcReserveId, amount, address(this)) returns (uint256, uint256 withdrawn) {
+        // Try to withdraw from Aave (V3 withdraw returns the amount withdrawn)
+        try aavePool.withdraw(address(usdcToken), amount, address(this)) returns (uint256 withdrawn) {
             return withdrawn;
         } catch {
             // Aave withdrawal failed
@@ -371,84 +347,73 @@ contract DepositManager is ReentrancyGuard, Owned {
     }
 
     /**
-     * @notice Gets the USDC balance supplied to Aave v4
-     * @return The USDC balance in Aave v4 (6 decimals), includes principal + accumulated earnings
+     * @notice Gets the USDC balance supplied to Aave v3
+     * @return The USDC balance in Aave v3 (6 decimals), includes principal + accumulated earnings
      */
     function getAaveUSDCBalance() external view returns (uint256) {
-        return aaveSpoke.getUserSuppliedAssets(usdcReserveId, address(this));
+        return ERC20(aUsdcToken).balanceOf(address(this));
     }
 
     /**
-     * @notice Gets the total available USDC balance (contract + Aave v4)
+     * @notice Gets the total available USDC balance (contract + Aave v3)
      * @return The total USDC balance available (6 decimals)
      */
     function getTotalAvailableBalance() external view returns (uint256) {
-        return usdcToken.balanceOf(address(this)) + aaveSpoke.getUserSuppliedAssets(usdcReserveId, address(this));
+        return usdcToken.balanceOf(address(this)) + ERC20(aUsdcToken).balanceOf(address(this));
     }
 
     /**
-     * @notice Gets the Aave v4 reserve configuration for USDC
-     * @return The reserve configuration struct containing paused, frozen, borrowable, etc.
+     * @notice Gets the Aave v3 reserve configuration for USDC
+     * @return The reserve configuration map containing paused, frozen, etc. flags
      */
-    function getUSDCReserveConfig() external view returns (ISpoke.ReserveConfig memory) {
-        return aaveSpoke.getReserveConfig(usdcReserveId);
+    function getUSDCReserveConfig() external view returns (DataTypes.ReserveConfigurationMap memory) {
+        return aavePool.getConfiguration(address(usdcToken));
     }
 
     /**
-     * @notice Gets the Aave v4 reserve data for USDC
-     * @return The full reserve struct containing underlying, hub, assetId, etc.
+     * @notice Gets the Aave v3 reserve data for USDC
+     * @return The full reserve data struct
      */
-    function getUSDCReserveData() external view returns (ISpoke.Reserve memory) {
-        return aaveSpoke.getReserve(usdcReserveId);
+    function getUSDCReserveData() external view returns (DataTypes.ReserveData memory) {
+        return aavePool.getReserveData(address(usdcToken));
     }
 
     /**
-     * @notice Gets the Hub address associated with USDC reserve
-     * @dev Rates can be queried from the Hub or its interest rate strategy
-     * @return The address of the Hub contract
+     * @notice Gets the aToken address for USDC
+     * @return The address of the aUSDC token
      */
-    function getUSDCHubAddress() external view returns (address) {
-        ISpoke.Reserve memory reserve = aaveSpoke.getReserve(usdcReserveId);
-        return address(reserve.hub);
+    function getATokenAddress() external view returns (address) {
+        return aUsdcToken;
     }
 
     /**
-     * @notice Gets the asset ID for USDC in the Hub
-     * @return The asset ID used in the Hub
-     */
-    function getUSDCAssetId() external view returns (uint16) {
-        ISpoke.Reserve memory reserve = aaveSpoke.getReserve(usdcReserveId);
-        return reserve.assetId;
-    }
-
-    /**
-     * @notice Gets the Aave v4 supply pause/frozen status
+     * @notice Gets the Aave v3 supply pause/frozen status
      * @return True if Aave supply is paused or frozen, false otherwise
      * @dev paused blocks all interactions, frozen blocks new supplies/borrows
      */
     function isAaveSupplyPaused() external view returns (bool) {
-        ISpoke.ReserveConfig memory config = aaveSpoke.getReserveConfig(usdcReserveId);
-        return config.paused || config.frozen;
+        DataTypes.ReserveConfigurationMap memory config = aavePool.getConfiguration(address(usdcToken));
+        return config.getPaused() || config.getFrozen();
     }
 
     /**
-     * @notice Gets the Aave v4 withdraw pause status
+     * @notice Gets the Aave v3 withdraw pause status
      * @return True if Aave withdraw is paused, false otherwise
      * @dev Note: frozen state does not block withdrawals, only paused does
      */
     function isAaveWithdrawPaused() external view returns (bool) {
-        ISpoke.ReserveConfig memory config = aaveSpoke.getReserveConfig(usdcReserveId);
-        return config.paused;
+        DataTypes.ReserveConfigurationMap memory config = aavePool.getConfiguration(address(usdcToken));
+        return config.getPaused();
     }
 
     /**
-     * @notice Gets the total accumulated earnings from Aave v4
+     * @notice Gets the total accumulated earnings from Aave v3
      * @return The total earnings in USDC (6 decimals)
      * @dev Earnings = current Aave balance - total principal deposited
      * @dev Principal is calculated from total platform tokens minted (1:1 ratio)
      */
     function getAccumulatedEarnings() external view returns (uint256) {
-        uint256 currentAaveBalance = aaveSpoke.getUserSuppliedAssets(usdcReserveId, address(this));
+        uint256 currentAaveBalance = ERC20(aUsdcToken).balanceOf(address(this));
         uint256 totalTokensMinted = platformToken.totalSupply();
         uint256 totalPrincipalDeposited = totalTokensMinted / 1e12; // Convert 18 decimals to 6 decimals
 
@@ -500,7 +465,7 @@ contract DepositManager is ReentrancyGuard, Owned {
 
         // Calculate current available USDC
         uint256 tokenManagerBalance = usdcToken.balanceOf(address(this));
-        uint256 aaveBalance = aaveSpoke.getUserSuppliedAssets(usdcReserveId, address(this));
+        uint256 aaveBalance = ERC20(aUsdcToken).balanceOf(address(this));
         uint256 totalAvailableUSDC = tokenManagerBalance + aaveBalance;
 
         // Calculate excess (yield) that can be taken
@@ -528,7 +493,7 @@ contract DepositManager is ReentrancyGuard, Owned {
      * @dev Only callable by the contract owner. Owner can call at any time for true emergencies.
      * @param to The address to receive all USDC
      *
-     * This function withdraws all USDC from both the contract and Aave v4,
+     * This function withdraws all USDC from both the contract and Aave v3,
      * regardless of token supply backing. Use only in emergency situations.
      *
      * Requirements:

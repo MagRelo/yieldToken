@@ -5,14 +5,15 @@ import {Test} from "forge-std/Test.sol";
 import {DepositManager} from "../src/DepositManager.sol";
 import {PlatformToken} from "../src/PlatformToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
-import {MockAaveSpoke} from "./mocks/MockAaveSpoke.sol";
-import {ISpoke} from "aave-v4/src/spoke/interfaces/ISpoke.sol";
+import {MockAavePool} from "./mocks/MockAavePool.sol";
+import {MockAToken} from "./mocks/MockAToken.sol";
 
 contract DepositManagerFuzzTest is Test {
     DepositManager public depositManager;
     PlatformToken public platformToken;
     MockERC20 public usdcToken;
-    MockAaveSpoke public mockAaveSpoke;
+    MockAavePool public mockAavePool;
+    MockAToken public mockAToken;
 
     address public owner = address(0x1);
     address public user1 = address(0x2);
@@ -21,38 +22,22 @@ contract DepositManagerFuzzTest is Test {
 
     uint256 public constant USDC_DECIMALS = 6;
     uint256 public constant PLATFORM_TOKEN_DECIMALS = 18;
-    uint256 public constant RESERVE_ID = 0;
 
     function setUp() public {
         // Deploy tokens
         usdcToken = new MockERC20("USD Coin", "USDC", uint8(USDC_DECIMALS));
 
-        // Deploy mock Aave Spoke
-        mockAaveSpoke = new MockAaveSpoke();
+        // Deploy mock Aave Pool and aToken
+        mockAavePool = new MockAavePool();
+        mockAToken = new MockAToken("Aave USDC", "aUSDC", uint8(USDC_DECIMALS), address(mockAavePool), address(usdcToken));
 
         // Setup Aave reserve for USDC
-        ISpoke.ReserveConfig memory config = ISpoke.ReserveConfig({
-            collateralRisk: 0,
-            paused: false,
-            frozen: false,
-            borrowable: true,
-            liquidatable: true,
-            receiveSharesEnabled: true
-        });
-
-        mockAaveSpoke.setupReserve(
-            RESERVE_ID,
-            address(usdcToken),
-            address(0x100), // mock hub
-            uint16(0), // assetId
-            uint8(USDC_DECIMALS),
-            config
-        );
+        mockAavePool.setupReserve(address(usdcToken), address(mockAToken), false, false);
 
         // Deploy PlatformToken and DepositManager as owner
         vm.startPrank(owner);
         platformToken = new PlatformToken("Cut Platform Token", "CUT");
-        depositManager = new DepositManager(address(usdcToken), address(platformToken), address(mockAaveSpoke));
+        depositManager = new DepositManager(address(usdcToken), address(platformToken), address(mockAavePool));
 
         // Set DepositManager in PlatformToken
         platformToken.setDepositManager(address(depositManager));
@@ -377,11 +362,16 @@ contract DepositManagerFuzzTest is Test {
         depositManager.depositUSDC(depositAmount);
 
         // Simulate yield
-        mockAaveSpoke.setYieldRateBps(yieldBps);
-        mockAaveSpoke.accrueYield(RESERVE_ID, address(depositManager));
+        mockAavePool.setYieldRateBps(yieldBps);
+        mockAavePool.accrueYield(address(usdcToken), address(depositManager));
+
+        // Mint extra USDC to the pool to back the yield
+        uint256 aaveBalance = depositManager.getAaveUSDCBalance();
+        if (aaveBalance > depositAmount) {
+            usdcToken.mint(address(mockAavePool), aaveBalance - depositAmount);
+        }
 
         // Calculate expected excess
-        uint256 aaveBalance = depositManager.getAaveUSDCBalance();
         uint256 requiredBacking = depositAmount;
         uint256 excess = aaveBalance > requiredBacking ? aaveBalance - requiredBacking : 0;
 

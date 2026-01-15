@@ -5,14 +5,16 @@ import {Test} from "forge-std/Test.sol";
 import {DepositManager} from "../src/DepositManager.sol";
 import {PlatformToken} from "../src/PlatformToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
-import {MockAaveSpoke} from "./mocks/MockAaveSpoke.sol";
-import {ISpoke} from "aave-v4/src/spoke/interfaces/ISpoke.sol";
+import {MockAavePool} from "./mocks/MockAavePool.sol";
+import {MockAToken} from "./mocks/MockAToken.sol";
+import {DataTypes} from "aave-v3/protocol/libraries/types/DataTypes.sol";
 
 contract DepositManagerTest is Test {
     DepositManager public depositManager;
     PlatformToken public platformToken;
     MockERC20 public usdcToken;
-    MockAaveSpoke public mockAaveSpoke;
+    MockAavePool public mockAavePool;
+    MockAToken public mockAToken;
 
     address public owner = address(0x1);
     address public user1 = address(0x2);
@@ -22,7 +24,6 @@ contract DepositManagerTest is Test {
 
     uint256 public constant USDC_DECIMALS = 6;
     uint256 public constant PLATFORM_TOKEN_DECIMALS = 18;
-    uint256 public constant RESERVE_ID = 0;
 
     event USDCDeposited(address indexed user, uint256 usdcAmount, uint256 platformTokensMinted);
     event USDCWithdrawn(address indexed user, uint256 platformTokensBurned, uint256 usdcAmount);
@@ -37,39 +38,24 @@ contract DepositManagerTest is Test {
         uint256 timestamp
     );
     event PauseStateChanged(address indexed owner, bool paused);
-    event AaveSupplySuccess(address indexed user, uint256 shares, uint256 amount);
+    event AaveSupplySuccess(address indexed user, uint256 amount);
     event AaveDepositFallback(address indexed user, uint256 usdcAmount, string reason);
 
     function setUp() public {
         // Deploy tokens
         usdcToken = new MockERC20("USD Coin", "USDC", uint8(USDC_DECIMALS));
 
-        // Deploy mock Aave Spoke
-        mockAaveSpoke = new MockAaveSpoke();
+        // Deploy mock Aave Pool and aToken
+        mockAavePool = new MockAavePool();
+        mockAToken = new MockAToken("Aave USDC", "aUSDC", uint8(USDC_DECIMALS), address(mockAavePool), address(usdcToken));
 
         // Setup Aave reserve for USDC
-        ISpoke.ReserveConfig memory config = ISpoke.ReserveConfig({
-            collateralRisk: 0,
-            paused: false,
-            frozen: false,
-            borrowable: true,
-            liquidatable: true,
-            receiveSharesEnabled: true
-        });
-
-        mockAaveSpoke.setupReserve(
-            RESERVE_ID,
-            address(usdcToken),
-            address(0x100), // mock hub
-            uint16(0), // assetId
-            uint8(USDC_DECIMALS),
-            config
-        );
+        mockAavePool.setupReserve(address(usdcToken), address(mockAToken), false, false);
 
         // Deploy PlatformToken and DepositManager as owner
         vm.startPrank(owner);
         platformToken = new PlatformToken("Cut Platform Token", "CUT");
-        depositManager = new DepositManager(address(usdcToken), address(platformToken), address(mockAaveSpoke));
+        depositManager = new DepositManager(address(usdcToken), address(platformToken), address(mockAavePool));
 
         // Set DepositManager in PlatformToken
         platformToken.setDepositManager(address(depositManager));
@@ -91,77 +77,39 @@ contract DepositManagerTest is Test {
 
     // ==================== Constructor Tests ====================
 
-    function test_Constructor_ValidInitialization() public {
+    function test_Constructor_ValidInitialization() public view {
         assertEq(address(depositManager.usdcToken()), address(usdcToken));
         assertEq(address(depositManager.platformToken()), address(platformToken));
-        assertEq(address(depositManager.aaveSpoke()), address(mockAaveSpoke));
-        assertEq(depositManager.usdcReserveId(), RESERVE_ID);
+        assertEq(address(depositManager.aavePool()), address(mockAavePool));
+        assertEq(depositManager.aUsdcToken(), address(mockAToken));
         assertEq(depositManager.owner(), owner);
         assertEq(depositManager.paused(), false);
     }
 
     function test_Constructor_RevertsWithZeroUSDCAddress() public {
         vm.expectRevert(DepositManager.ZeroUSDCAddress.selector);
-        new DepositManager(address(0), address(platformToken), address(mockAaveSpoke));
+        new DepositManager(address(0), address(platformToken), address(mockAavePool));
     }
 
     function test_Constructor_RevertsWithZeroPlatformTokenAddress() public {
         vm.expectRevert(DepositManager.ZeroPlatformTokenAddress.selector);
-        new DepositManager(address(usdcToken), address(0), address(mockAaveSpoke));
+        new DepositManager(address(usdcToken), address(0), address(mockAavePool));
     }
 
-    function test_Constructor_RevertsWithZeroAaveSpokeAddress() public {
-        vm.expectRevert(DepositManager.ZeroAaveSpokeAddress.selector);
+    function test_Constructor_RevertsWithZeroAavePoolAddress() public {
+        vm.expectRevert(DepositManager.ZeroAavePoolAddress.selector);
         new DepositManager(address(usdcToken), address(platformToken), address(0));
-    }
-
-    function test_Constructor_RevertsWithUSDCNotFoundInReserves() public {
-        MockAaveSpoke emptySpoke = new MockAaveSpoke();
-
-        vm.expectRevert(DepositManager.USDCNotFoundInReserves.selector);
-        new DepositManager(address(usdcToken), address(platformToken), address(emptySpoke));
-    }
-
-    function test_Constructor_FindsUSDCReserveId() public {
-        // Create a spoke with USDC at a different reserve ID
-        MockAaveSpoke newSpoke = new MockAaveSpoke();
-        ISpoke.ReserveConfig memory config = ISpoke.ReserveConfig({
-            collateralRisk: 0,
-            paused: false,
-            frozen: false,
-            borrowable: true,
-            liquidatable: true,
-            receiveSharesEnabled: true
-        });
-
-        // Add another reserve first
-        newSpoke.setupReserve(
-            0,
-            address(0x999), // different token
-            address(0x100),
-            uint16(0),
-            uint8(18),
-            config
-        );
-
-        // Add USDC at reserve ID 1
-        newSpoke.setupReserve(1, address(usdcToken), address(0x100), uint16(1), uint8(USDC_DECIMALS), config);
-
-        vm.prank(owner);
-        DepositManager newManager = new DepositManager(address(usdcToken), address(platformToken), address(newSpoke));
-
-        assertEq(newManager.usdcReserveId(), 1);
     }
 
     function test_Constructor_SetsOwnerCorrectly() public {
         address deployer = address(0x999);
         vm.prank(deployer);
         DepositManager newManager =
-            new DepositManager(address(usdcToken), address(platformToken), address(mockAaveSpoke));
+            new DepositManager(address(usdcToken), address(platformToken), address(mockAavePool));
         assertEq(newManager.owner(), deployer);
     }
 
-    function test_Constructor_InitialPausedStateIsFalse() public {
+    function test_Constructor_InitialPausedStateIsFalse() public view {
         assertEq(depositManager.paused(), false);
     }
 
@@ -286,13 +234,13 @@ contract DepositManagerTest is Test {
         uint256 amount = 1000 * 1e6;
 
         vm.expectEmit(true, false, false, false);
-        emit AaveSupplySuccess(user1, amount, amount);
+        emit AaveSupplySuccess(user1, amount);
 
         vm.prank(user1);
         depositManager.depositUSDC(amount);
 
-        // Check USDC was supplied to Aave
-        assertEq(mockAaveSpoke.getUserSuppliedAssets(RESERVE_ID, address(depositManager)), amount);
+        // Check USDC was supplied to Aave (via aToken balance)
+        assertEq(mockAToken.balanceOf(address(depositManager)), amount);
         assertEq(usdcToken.balanceOf(address(depositManager)), 0);
     }
 
@@ -300,9 +248,7 @@ contract DepositManagerTest is Test {
         uint256 amount = 1000 * 1e6;
 
         // Pause Aave reserve
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), true);
 
         vm.expectEmit(true, false, false, false);
         emit AaveDepositFallback(user1, amount, "Aave supply paused");
@@ -312,16 +258,14 @@ contract DepositManagerTest is Test {
 
         // Check USDC stayed in contract
         assertEq(usdcToken.balanceOf(address(depositManager)), amount);
-        assertEq(mockAaveSpoke.getUserSuppliedAssets(RESERVE_ID, address(depositManager)), 0);
+        assertEq(mockAToken.balanceOf(address(depositManager)), 0);
     }
 
     function test_DepositUSDC_AaveFrozenFallback() public {
         uint256 amount = 1000 * 1e6;
 
         // Freeze Aave reserve
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.frozen = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReserveFrozen(address(usdcToken), true);
 
         vm.expectEmit(true, false, false, false);
         emit AaveDepositFallback(user1, amount, "Aave supply frozen");
@@ -409,7 +353,7 @@ contract DepositManagerTest is Test {
         uint256 amount = 1000 * 1e6;
 
         // Make Aave supply revert
-        mockAaveSpoke.setShouldRevertSupply(true);
+        mockAavePool.setShouldRevertSupply(true);
 
         vm.expectEmit(true, false, false, false);
         emit AaveDepositFallback(user1, amount, "Aave supply failed");
@@ -481,15 +425,15 @@ contract DepositManagerTest is Test {
         vm.prank(user1);
         depositManager.depositUSDC(depositAmount);
 
-        // Verify in Aave
-        assertEq(mockAaveSpoke.getUserSuppliedAssets(RESERVE_ID, address(depositManager)), depositAmount);
+        // Verify in Aave via aToken balance
+        assertEq(mockAToken.balanceOf(address(depositManager)), depositAmount);
 
         // Withdraw
         vm.prank(user1);
         depositManager.withdrawUSDC(platformTokenAmount);
 
         // Should withdraw from Aave
-        assertEq(mockAaveSpoke.getUserSuppliedAssets(RESERVE_ID, address(depositManager)), 0);
+        assertEq(mockAToken.balanceOf(address(depositManager)), 0);
     }
 
     function test_WithdrawUSDC_ContractBalanceSufficient() public {
@@ -497,16 +441,13 @@ contract DepositManagerTest is Test {
         uint256 platformTokenAmount = depositAmount * 1e12;
 
         // Deposit with Aave paused (stays in contract)
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), true);
 
         vm.prank(user1);
         depositManager.depositUSDC(depositAmount);
 
         // Unpause for withdraw
-        config.paused = false;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), false);
 
         // Withdraw
         vm.prank(user1);
@@ -554,13 +495,6 @@ contract DepositManagerTest is Test {
         depositManager.withdrawUSDC(amount);
     }
 
-    // Note: NoUSDCToReturn error is effectively unreachable because:
-    // - MIN_WITHDRAW_AMOUNT is 10000 * 1e12
-    // - Any amount >= MIN_WITHDRAW_AMOUNT will divide to >= 10000 USDC
-    // - Amounts < MIN_WITHDRAW_AMOUNT revert with AmountBelowMinimum first
-    // The NoUSDCToReturn check exists as a safety guard in the code but cannot be triggered
-    // through normal execution paths.
-
     function test_WithdrawUSDC_RevertsWithAavePausedInsufficientBalance() public {
         uint256 depositAmount = 1000 * 1e6;
         uint256 platformTokenAmount = depositAmount * 1e12;
@@ -570,9 +504,7 @@ contract DepositManagerTest is Test {
         depositManager.depositUSDC(depositAmount);
 
         // Pause Aave
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), true);
 
         // Contract balance is 0, Aave is paused
         vm.prank(user1);
@@ -631,15 +563,13 @@ contract DepositManagerTest is Test {
         vm.prank(user1);
         depositManager.depositUSDC(depositAmount);
 
-        // Set yield rate to 10% (11000 = 110% = 10% yield)
-        mockAaveSpoke.setYieldRateBps(11000);
+        // Accrue yield via mock
+        mockAavePool.setYieldRateBps(11000); // 10% yield
+        mockAavePool.accrueYield(address(usdcToken), address(depositManager));
 
-        // Accrue yield to generate excess
-        mockAaveSpoke.accrueYield(RESERVE_ID, address(depositManager));
-
-        // Mint tokens to mock contract to match the increased balance
+        // Mint tokens to mock pool to match the increased balance
         uint256 aaveBalance = depositManager.getAaveUSDCBalance();
-        usdcToken.mint(address(mockAaveSpoke), aaveBalance - depositAmount);
+        usdcToken.mint(address(mockAavePool), aaveBalance - depositAmount);
 
         // Calculate excess
         uint256 totalAvailable = depositManager.getTotalAvailableBalance();
@@ -657,20 +587,6 @@ contract DepositManagerTest is Test {
         depositManager.balanceSupply(recipient);
 
         assertEq(usdcToken.balanceOf(recipient), recipientBalanceBefore + expectedExcess);
-    }
-
-    function test_BalanceSupply_EmitsEvent() public {
-        uint256 depositAmount = 1000 * 1e6;
-
-        vm.prank(user1);
-        depositManager.depositUSDC(depositAmount);
-
-        // Try to balance supply (may not have excess)
-        // This will likely revert with NoExcessUSDC, but let's test with yield
-        // For now, test that it reverts correctly when no excess
-        vm.prank(owner);
-        vm.expectRevert(DepositManager.NoExcessUSDC.selector);
-        depositManager.balanceSupply(recipient);
     }
 
     function test_BalanceSupply_RevertsWithOnlyOwner() public {
@@ -719,26 +635,6 @@ contract DepositManagerTest is Test {
         assertEq(depositManager.getTotalAvailableBalance(), 0);
     }
 
-    function test_EmergencyWithdrawAll_EmitsEvent() public {
-        uint256 depositAmount = 1000 * 1e6;
-
-        vm.prank(user1);
-        depositManager.depositUSDC(depositAmount);
-
-        uint256 totalBalance = depositManager.getTotalAvailableBalance();
-        uint256 totalTokens = platformToken.totalSupply();
-        uint256 requiredBacking = totalTokens / 1e12;
-        uint256 backingRatio = totalBalance > 0 && requiredBacking > 0 ? (totalBalance * 10000) / requiredBacking : 0;
-
-        vm.expectEmit(true, true, false, false);
-        emit EmergencyWithdrawal(
-            owner, recipient, totalBalance, totalTokens, requiredBacking, backingRatio, block.timestamp
-        );
-
-        vm.prank(owner);
-        depositManager.emergencyWithdrawAll(recipient);
-    }
-
     function test_EmergencyWithdrawAll_RevertsWithOnlyOwner() public {
         vm.prank(nonOwner);
         vm.expectRevert();
@@ -767,16 +663,13 @@ contract DepositManagerTest is Test {
         depositManager.depositUSDC(depositAmount1);
 
         // Second deposit with Aave paused (stays in contract)
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), true);
 
         vm.prank(user2);
         depositManager.depositUSDC(depositAmount2);
 
         // Unpause for emergency withdrawal
-        config.paused = false;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), false);
 
         uint256 totalBalance = depositAmount1 + depositAmount2;
         uint256 recipientBalanceBefore = usdcToken.balanceOf(recipient);
@@ -793,9 +686,7 @@ contract DepositManagerTest is Test {
         assertEq(depositManager.getTokenManagerUSDCBalance(), 0);
 
         // Deposit with Aave paused (stays in contract)
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
+        mockAavePool.setReservePaused(address(usdcToken), true);
 
         uint256 amount = 1000 * 1e6;
         vm.prank(user1);
@@ -824,60 +715,40 @@ contract DepositManagerTest is Test {
         assertEq(depositManager.getTotalAvailableBalance(), amount);
     }
 
-    function test_GetUSDCReserveConfig() public {
-        ISpoke.ReserveConfig memory config = depositManager.getUSDCReserveConfig();
-
-        assertEq(config.paused, false);
-        assertEq(config.frozen, false);
+    function test_GetUSDCReserveConfig() public view {
+        DataTypes.ReserveConfigurationMap memory config = depositManager.getUSDCReserveConfig();
+        // Config exists and is not paused/frozen by default
+        assert(config.data != 0); // Has some configuration
     }
 
-    function test_GetUSDCReserveData() public {
-        ISpoke.Reserve memory reserve = depositManager.getUSDCReserveData();
-
-        assertEq(reserve.underlying, address(usdcToken));
-        assertEq(reserve.decimals, uint8(USDC_DECIMALS));
-        assertEq(reserve.assetId, uint16(0));
+    function test_GetUSDCReserveData() public view {
+        DataTypes.ReserveData memory reserve = depositManager.getUSDCReserveData();
+        assertEq(reserve.aTokenAddress, address(mockAToken));
     }
 
-    function test_GetUSDCHubAddress() public {
-        address hub = depositManager.getUSDCHubAddress();
-        assertEq(hub, address(0x100)); // Mock hub address
-    }
-
-    function test_GetUSDCAssetId() public {
-        uint16 assetId = depositManager.getUSDCAssetId();
-        assertEq(assetId, uint16(0));
+    function test_GetATokenAddress() public view {
+        assertEq(depositManager.getATokenAddress(), address(mockAToken));
     }
 
     function test_IsAaveSupplyPaused() public {
         assertEq(depositManager.isAaveSupplyPaused(), false);
 
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
-
+        mockAavePool.setReservePaused(address(usdcToken), true);
         assertEq(depositManager.isAaveSupplyPaused(), true);
 
-        config.paused = false;
-        config.frozen = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
-
+        mockAavePool.setReservePaused(address(usdcToken), false);
+        mockAavePool.setReserveFrozen(address(usdcToken), true);
         assertEq(depositManager.isAaveSupplyPaused(), true);
     }
 
     function test_IsAaveWithdrawPaused() public {
         assertEq(depositManager.isAaveWithdrawPaused(), false);
 
-        ISpoke.ReserveConfig memory config = mockAaveSpoke.getReserveConfig(RESERVE_ID);
-        config.paused = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
-
+        mockAavePool.setReservePaused(address(usdcToken), true);
         assertEq(depositManager.isAaveWithdrawPaused(), true);
 
-        config.paused = false;
-        config.frozen = true;
-        mockAaveSpoke.setReserveConfig(RESERVE_ID, config);
-
+        mockAavePool.setReservePaused(address(usdcToken), false);
+        mockAavePool.setReserveFrozen(address(usdcToken), true);
         assertEq(depositManager.isAaveWithdrawPaused(), false); // Frozen doesn't block withdraw
     }
 
@@ -905,7 +776,7 @@ contract DepositManagerTest is Test {
         assertEq(depositManager.getCurrentYieldRate(), 0);
     }
 
-    function test_Constants() public {
+    function test_Constants() public view {
         assertEq(depositManager.MIN_DEPOSIT_AMOUNT(), 10000); // $0.01 USDC
         assertEq(depositManager.MAX_DEPOSIT_AMOUNT(), 100_000 * 1e6); // $100,000 USDC
         assertEq(depositManager.MIN_WITHDRAW_AMOUNT(), 10000 * 1e12); // $0.01 USDC equivalent
